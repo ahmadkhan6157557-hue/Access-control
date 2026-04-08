@@ -1,0 +1,144 @@
+IDOR — Insecure Direct Object Reference
+What It Is
+IDOR happens when an application exposes a reference to an internal object — a database ID, a filename, an account number — and doesn't verify 
+whether the requesting user actually has permission to access it.
+The server trusts the value in the request. If you change it, you get someone else's data.
+That's it. Simple concept, massive impact.
+
+How It Looks in the Wild
+Numeric IDs in URLs
+GET /api/invoices/1084
+Change 1084 to 1083, 1085, 1000 — if the server returns another user's invoice without checking ownership, it's vulnerable.
+GUIDs / UUIDs
+Some developers assume UUIDs are secure because they're hard to guess. They're not a security control — they're just long IDs.
+GET /api/files/3f7a1c2d-9e4b-41fa-b8c3-0e2d5f6a7b1e
+If you find one UUID (from a response, a link, a notification), you can test if others are accessible. GUIDs found in emails, shared links, or API responses are fair game.
+Object References in POST Bodies
+jsonPOST /api/messages/send
+{
+  "to_user_id": 2291,
+  "message": "hey"
+}
+What happens if you change to_user_id to 1? Can you message users you shouldn't reach? Can you trigger actions on behalf of other accounts?
+File Downloads
+GET /download?file=report_user_2291.pdf
+Try:
+GET /download?file=report_user_2290.pdf
+GET /download?file=../config/settings.ini
+File-based IDORs often lead directly to sensitive document access or path traversal.
+API Endpoints with Encoded References
+Sometimes the ID is base64-encoded or hashed — don't let that stop you. Decode it, modify it, re-encode.
+eyJ1c2VyX2lkIjogMjI5MX0=  →  {"user_id": 2291}  →  {"user_id": 1}  →  eyJ1c2VyX2lkIjogMX0=
+
+Testing Methodology
+Step 1 — Create Two Accounts
+Always test with two separate accounts (attacker and victim). This gives you:
+
+Victim's object references
+Attacker's session to replay requests with
+
+Step 2 — Map All Object References
+While browsing normally, note every ID, reference, or identifier that appears in:
+
+URLs
+Request bodies (JSON/form data)
+Response bodies
+Headers (e.g., X-User-ID)
+
+Step 3 — Swap References Across Sessions
+Use Burp's Repeater with the attacker's session cookies, but plug in the victim's object IDs. If you get a 200 OK with data, you've found an IDOR.
+Step 4 — Test All HTTP Methods
+An endpoint might enforce access control on GET but not on PUT, DELETE, or PATCH.
+GET  /api/user/2291/profile   → 403 Forbidden ✓
+PUT  /api/user/2291/profile   → 200 OK        ✗ (IDOR on write)
+DELETE /api/user/2291/profile → 200 OK        ✗ (IDOR on delete)
+Step 5 — Check Indirect References
+Some apps use indirect references in one place but expose the direct reference in another (e.g., a download endpoint that reveals the real filename in the response).
+
+Common Places to Find IDORs
+LocationWhat to Look ForProfile/account pagesUser ID in URL or request bodyFile download / exportFilename or file ID in parameterOrder / invoice / receipt pagesOrder IDsAdmin
+or support APIsUser reference passed by the clientPassword reset / email changeToken or user reference in bodyAPI responsesOther users' IDs exposed in the dataNotification / messaging
+systemsRecipient
+or sender ID
+
+Impact
+IDORs range from low to critical depending on what object is exposed:
+
+Low — reading non-sensitive public-ish data
+Medium — reading another user's private data (messages, orders, PII)
+High — modifying or deleting another user's data
+Critical — account takeover, accessing admin functionality, bulk data exposure
+
+Bug bounty programs pay well for IDORs — especially ones that expose PII or allow unauthorized writes.
+
+Burp Suite Setup for IDOR Testing
+Autorize extension is the fastest way to test at scale:
+
+Install Autorize from BApp Store
+Paste the victim's session cookie into Autorize
+Browse the app as the attacker
+Autorize replays every request with the victim's session automatically
+Green = enforced, Red = IDOR
+
+Manual approach using Repeater:
+
+Capture request with victim's object ID
+Replace session cookie with attacker's cookie
+Send — check if the response returns the victim's data
+
+
+Bypasses Worth Trying
+If the obvious swap doesn't work, try these:
+# Parameter pollution
+GET /api/user?id=1&id=2291
+
+# Array wrapping
+{"user_id": [2291]}
+
+# Type confusion
+{"user_id": "2291"}   vs   {"user_id": 2291}
+
+# Wildcard / null
+{"user_id": "*"}
+{"user_id": null}
+{"user_id": 0}
+
+# Negative IDs
+GET /api/orders/-1
+
+# Padding / encoding
+GET /api/user/00002291
+GET /api/user/%32%32%39%31
+
+Real Example (Sanitized)
+Target: A SaaS project management app
+Endpoint: GET /api/v1/projects/{project_id}/export
+Finding: Project IDs were sequential integers. Authenticated users could export any project by incrementing the ID — including projects from other organizations.
+Impact: Full data exfiltration across tenant boundaries (critical in a multi-tenant SaaS).
+Fix: Server-side check that project.organization_id == current_user.organization_id before returning export.
+
+Remediation
+The fix is always the same: enforce authorization server-side on every request.
+
+Never trust object references sent by the client
+Always verify the requesting user owns or has permission to access the object
+Use indirect reference maps where possible (map session-scoped tokens to real IDs server-side)
+Apply access control checks in a centralized layer — not scattered across individual endpoints
+
+python# Wrong
+def get_invoice(invoice_id):
+    return db.query(Invoice).filter_by(id=invoice_id).first()
+
+# Right
+def get_invoice(invoice_id, current_user):
+    invoice = db.query(Invoice).filter_by(id=invoice_id).first()
+    if invoice.user_id != current_user.id:
+        raise PermissionDenied()
+    return invoice
+
+References
+
+PortSwigger — IDOR
+OWASP Testing Guide — Testing for IDOR
+HackerOne — IDOR Reports
+Nahamsec — Finding IDORs
